@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"slices"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type Key struct {
@@ -31,7 +33,8 @@ type Key struct {
 
 	// Metadata holds an ordered list of arbitrary keys and associated
 	// string values to associate with the interval and processing time.
-	Metadata []KeyValues
+	// Note that only string slice attributes are supported.
+	Metadata attribute.Set
 }
 
 type KeyValues struct {
@@ -45,11 +48,16 @@ func (k *Key) AppendBinary(b []byte) ([]byte, error) {
 	b = slices.Grow(b, 10)
 	b = binary.BigEndian.AppendUint16(b, uint16(k.Interval.Seconds()))
 	b = binary.BigEndian.AppendUint64(b, uint64(k.ProcessingTime.Unix()))
-	if len(k.Metadata) != 0 {
-		b = binary.AppendUvarint(b, uint64(len(k.Metadata)))
-		for _, kvs := range k.Metadata {
-			mk := kvs.Key
-			mvs := kvs.Values
+	if k.Metadata.Len() != 0 {
+		b = binary.AppendUvarint(b, uint64(k.Metadata.Len()))
+		iter := k.Metadata.Iter()
+		for iter.Next() {
+			attr := iter.Attribute()
+			mk := attr.Key
+			if attr.Value.Type() != attribute.STRINGSLICE {
+				return nil, errors.New("invalid metadata type, only string slice allowed")
+			}
+			mvs := attr.Value.AsStringSlice()
 
 			b = binary.AppendUvarint(b, uint64(len(mk)))
 			b = append(b, mk...)
@@ -78,7 +86,7 @@ func (k *Key) Unmarshal(d []byte) error {
 			return fmt.Errorf("error reading number of metadata keys (n=%d)", n)
 		}
 		d = d[n:]
-		k.Metadata = make([]KeyValues, numKeys)
+		metadataAttrs := make([]attribute.KeyValue, numKeys)
 
 		for i := range numKeys {
 			mklen, n := binary.Uvarint(d)
@@ -105,9 +113,9 @@ func (k *Key) Unmarshal(d []byte) error {
 				d = d[mvlen:]
 				mvs[i] = mv
 			}
-
-			k.Metadata[i] = KeyValues{Key: mk, Values: mvs}
+			metadataAttrs[i] = attribute.StringSlice(mk, mvs)
 		}
+		k.Metadata = attribute.NewSet(metadataAttrs...)
 	}
 
 	return nil

@@ -25,14 +25,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottldatapoint"
 	"go.opentelemetry.io/collector/client"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/processor"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
 	"github.com/elastic/opentelemetry-collector-components/processor/lsmintervalprocessor/config"
@@ -65,14 +66,15 @@ const (
 	// a MemTable is being flushed.
 	pebbleMemTableStopWritesThreshold = 2
 
-	// dbCommitThresholdBytes is a soft limit and the batch is committed
-	// to the DB as soon as it crosses this threshold. To make sure that
-	// the commit threshold plays well with the max retained batch size
-	// the threshold should be kept smaller than the sum of max retained
-	// batch size and encoded size of aggregated data to be committed.
-	// However, this requires https://github.com/cockroachdb/pebble/pull/3139.
-	// So, for now we are only tweaking the available options.
-	dbCommitThresholdBytes = 8 << 20 // 8MB
+	// dbCommitDatapointsThresholdCount is the soft limit on the count of
+	// the datapoints after which the value is committed to the database.
+	// The threshold is not based on size in bytes, however, to make sure
+	// that the commit threshold plays well with the max retained batch size
+	// the threshold should be kept smaller than the expected sum of max
+	// retained batch size and encoded size of aggregated data to be
+	// committed. In order to achieve this we can estimate the size of the
+	// datapoint.
+	dbCommitDatapointsThresholdCount = 16384
 )
 
 type Processor struct {
@@ -88,7 +90,8 @@ type Processor struct {
 	next      consumer.Metrics
 
 	mu             sync.Mutex
-	batch          *pebble.Batch
+	values         map[attribute.Set]*merger.Value
+	value          *merger.Value
 	processingTime time.Time
 
 	ctx           context.Context
@@ -145,6 +148,7 @@ func newProcessor(cfg *config.Config, ivlDefs []intervalDef, log *zap.Logger, ne
 		wOpts:              writeOpts,
 		intervals:          ivlDefs,
 		next:               next,
+		values:             make(map[attribute.Set]*merger.Value),
 		processingTime:     time.Now().UTC().Truncate(ivlDefs[0].Duration),
 		ctx:                ctx,
 		cancel:             cancel,
@@ -181,13 +185,20 @@ func (p *Processor) Start(ctx context.Context, host component.Host) error {
 			}
 
 			p.mu.Lock()
-			batch := p.batch
-			p.batch = nil
 			p.processingTime = to
+			values := p.values
+			p.values = make(map[attribute.Set]*merger.Value)
 			p.mu.Unlock()
 
+			for meta, v := range values {
+				if v == nil {
+					continue
+				}
+				p.commitValue(meta, v)
+			}
+
 			// Export the batch
-			if err := p.commitAndExport(p.ctx, batch, to); err != nil {
+			if err := p.export(ctx, to); err != nil {
 				p.logger.Warn("failed to export", zap.Error(err), zap.Time("end_time", to))
 			}
 
@@ -220,15 +231,13 @@ func (p *Processor) Shutdown(ctx context.Context) error {
 	// Ensure all data in the database is exported
 	if p.db != nil {
 		p.logger.Info("exporting all data before shutting down")
-		if p.batch != nil {
-			if err := p.batch.Commit(p.wOpts); err != nil {
-				return fmt.Errorf("failed to commit batch: %w", err)
+		for meta, v := range p.values {
+			if v == nil {
+				continue
 			}
-			if err := p.batch.Close(); err != nil {
-				return fmt.Errorf("failed to close batch: %w", err)
-			}
-			p.batch = nil
+			p.commitValue(meta, v)
 		}
+		p.values = nil
 
 		var errs []error
 		for _, ivl := range p.intervals {
@@ -258,14 +267,47 @@ func (p *Processor) Capabilities() consumer.Capabilities {
 	return consumer.Capabilities{MutatesData: true}
 }
 
-func (p *Processor) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) error {
+func (p *Processor) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) (errs error) {
+	clientInfo := client.FromContext(ctx)
+	clientMeta := make([]attribute.KeyValue, 0, len(p.sortedMetadataKeys))
+	for _, k := range p.sortedMetadataKeys {
+		values := clientInfo.Metadata.Get(k)
+		if len(values) == 0 {
+			continue
+		}
+		clientMeta = append(clientMeta, attribute.StringSlice(k, values))
+	}
+	clientMetaSet := attribute.NewSet(clientMeta...)
+
+	if err := p.mergeMetric(clientMetaSet, md); err != nil {
+		errs = errors.Join(errs, fmt.Errorf("failed to merge metric: %w", err))
+	}
+
+	// Call next for the metrics remaining in the input
+	if err := p.next.ConsumeMetrics(ctx, md); err != nil {
+		errs = errors.Join(errs, err)
+	}
+
+	return errs
+}
+
+func (p *Processor) mergeMetric(meta attribute.Set, md pmetric.Metrics) error {
 	var errs []error
-	v := merger.NewValue(
-		p.cfg.ResourceLimit,
-		p.cfg.ScopeLimit,
-		p.cfg.MetricLimit,
-		p.cfg.DatapointLimit,
-	)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	value, ok := p.values[meta]
+	if !ok || value == nil {
+		value = merger.NewValue(
+			p.cfg.ResourceLimit,
+			p.cfg.ScopeLimit,
+			p.cfg.MetricLimit,
+			p.cfg.DatapointLimit,
+		)
+		p.values[meta] = value
+	}
+
 	md.ResourceMetrics().RemoveIf(func(rm pmetric.ResourceMetrics) bool {
 		rm.ScopeMetrics().RemoveIf(func(sm pmetric.ScopeMetrics) bool {
 			sm.Metrics().RemoveIf(func(m pmetric.Metric) bool {
@@ -277,12 +319,12 @@ func (p *Processor) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) erro
 					if p.cfg.PassThrough.Summary {
 						return false
 					}
-					if err := v.MergeMetric(rm, sm, m); err != nil {
+					if err := value.MergeMetric(rm, sm, m); err != nil {
 						errs = append(errs, err)
 					}
 					return true
 				case pmetric.MetricTypeSum, pmetric.MetricTypeHistogram, pmetric.MetricTypeExponentialHistogram:
-					if err := v.MergeMetric(rm, sm, m); err != nil {
+					if err := value.MergeMetric(rm, sm, m); err != nil {
 						errs = append(errs, err)
 					}
 					return true
@@ -297,91 +339,47 @@ func (p *Processor) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) erro
 		return rm.ScopeMetrics().Len() == 0
 	})
 
-	vb, err := v.Marshal()
-	if err != nil {
-		return errors.Join(append(errs, fmt.Errorf("failed to marshal value to proto binary: %w", err))...)
-	}
-
-	clientInfo := client.FromContext(ctx)
-	clientMetadata := make([]merger.KeyValues, 0, len(p.sortedMetadataKeys))
-	for _, k := range p.sortedMetadataKeys {
-		if values := clientInfo.Metadata.Get(k); len(values) != 0 {
-			clientMetadata = append(clientMetadata, merger.KeyValues{
-				Key:    k,
-				Values: values,
-			})
+	// Commit it batch if it has enough data points. We don't use size
+	// of the pmetric here as getting the size is costly.
+	if value.DatapointsCount() > dbCommitDatapointsThresholdCount {
+		if err := p.commitValue(meta, value); err != nil {
+			return fmt.Errorf("failed to merge the value to batch: %w", err)
 		}
+		p.values[meta] = nil
 	}
-
-	if err := p.mergeToBatch(vb, clientMetadata); err != nil {
-		return fmt.Errorf("failed to merge the value to batch: %w", err)
-	}
-
-	// Call next for the metrics remaining in the input
-	if err := p.next.ConsumeMetrics(ctx, md); err != nil {
-		errs = append(errs, err)
-	}
-
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
 	return nil
 }
 
-func (p *Processor) mergeToBatch(vb []byte, clientMetadata []merger.KeyValues) (err error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.batch == nil {
-		p.batch = newBatch(p.db)
+func (p *Processor) commitValue(meta attribute.Set, val *merger.Value) error {
+	vb, err := val.Marshal()
+	if err != nil {
+		return fmt.Errorf("failed to marshal value to proto binary: %w", err)
 	}
 
 	var k []byte
+	batch := newBatch(p.db)
 	for _, ivl := range p.intervals {
 		key := merger.Key{
 			Interval:       ivl.Duration,
 			ProcessingTime: p.processingTime,
-			Metadata:       clientMetadata,
+			Metadata:       meta,
 		}
 		k, err := key.AppendBinary(k[:0])
 		if err != nil {
 			return fmt.Errorf("failed to marshal key to binary for ivl %s: %w", ivl.Duration, err)
 		}
-		if err := p.batch.Merge(k, vb, nil); err != nil {
+		if err := batch.Merge(k, vb, nil); err != nil {
 			return fmt.Errorf("failed to merge to db: %w", err)
 		}
 	}
-
-	if p.batch.Len() >= dbCommitThresholdBytes {
-		if err := p.batch.Commit(p.wOpts); err != nil {
-			return fmt.Errorf("failed to commit a batch to db: %w", err)
-		}
-		if err := p.batch.Close(); err != nil {
-			return fmt.Errorf("failed to close a batch post commit: %w", err)
-		}
-		p.batch = nil
+	if err := batch.Commit(p.wOpts); err != nil {
+		return fmt.Errorf("failed to commit a batch to db: %w", err)
 	}
-	return nil
-}
-
-// commitAndExport commits the batch to DB and exports all aggregated metrics in the provided range
-// bounded by `to. If the batch is not committed then a corresponding error would be returned however
-// exports will still proceed.
-func (p *Processor) commitAndExport(ctx context.Context, batch *pebble.Batch, to time.Time) error {
-	var errs []error
-	if batch != nil {
-		if err := batch.Commit(p.wOpts); err != nil {
-			errs = append(errs, fmt.Errorf("failed to commit batch before export: %w", err))
-		}
-		if err := batch.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close batch before export: %w", err))
-		}
-	}
-	if err := p.export(ctx, to); err != nil {
-		errs = append(errs, fmt.Errorf("failed to export: %w", err))
-	}
-	if len(errs) > 0 {
-		return errors.Join(errs...)
+	if err := batch.Close(); err != nil {
+		return fmt.Errorf("failed to close a batch post commit: %w", err)
 	}
 	return nil
 }
@@ -513,10 +511,15 @@ func (p *Processor) exportForInterval(
 				}
 			}
 		}
-		if n := len(key.Metadata); n != 0 {
+		if n := key.Metadata.Len(); n != 0 {
 			metadataMap := make(map[string][]string, n)
-			for _, kvs := range key.Metadata {
-				metadataMap[kvs.Key] = kvs.Values
+			for metaIter := key.Metadata.Iter(); metaIter.Next(); {
+				metaAttr := metaIter.Attribute()
+				if metaAttr.Value.Type() != attribute.STRINGSLICE {
+					errs = append(errs, errors.New("invalid metadata type, only string slice allowed"))
+					continue
+				}
+				metadataMap[string(metaAttr.Key)] = metaAttr.Value.AsStringSlice()
 			}
 			info := client.FromContext(ctx)
 			info.Metadata = client.NewMetadata(metadataMap)
