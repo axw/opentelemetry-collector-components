@@ -37,11 +37,6 @@ type Key struct {
 	Metadata attribute.Set
 }
 
-type KeyValues struct {
-	Key    string
-	Values []string
-}
-
 // AppendBinary marshals the key into its binary representation,
 // appending it to b.
 func (k *Key) AppendBinary(b []byte) ([]byte, error) {
