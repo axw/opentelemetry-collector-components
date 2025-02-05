@@ -91,7 +91,6 @@ type Processor struct {
 
 	mu             sync.Mutex
 	values         map[attribute.Set]*merger.Value
-	value          *merger.Value
 	processingTime time.Time
 
 	ctx           context.Context
@@ -194,7 +193,9 @@ func (p *Processor) Start(ctx context.Context, host component.Host) error {
 				if v == nil {
 					continue
 				}
-				p.commitValue(meta, v)
+				if err := p.commitValue(meta, v); err != nil {
+					p.logger.Warn("failed to commit value to database", zap.Error(err), zap.Time("end_time", to))
+				}
 			}
 
 			// Export the batch
@@ -230,16 +231,18 @@ func (p *Processor) Shutdown(ctx context.Context) error {
 
 	// Ensure all data in the database is exported
 	if p.db != nil {
+		var errs []error
 		p.logger.Info("exporting all data before shutting down")
 		for meta, v := range p.values {
 			if v == nil {
 				continue
 			}
-			p.commitValue(meta, v)
+			if err := p.commitValue(meta, v); err != nil {
+				errs = append(errs, fmt.Errorf("failed to commit value: %w", err))
+			}
 		}
 		p.values = nil
 
-		var errs []error
 		for _, ivl := range p.intervals {
 			// At any particular time there will be 1 export candidate for
 			// each aggregation interval. We will align the end time and
