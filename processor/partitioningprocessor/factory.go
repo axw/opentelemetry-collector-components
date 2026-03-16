@@ -45,18 +45,27 @@ func createDefaultConfig() component.Config {
 	return &Config{}
 }
 
-func createLogsProcessor(_ context.Context, _ processor.Settings, cfg component.Config, next consumer.Logs) (processor.Logs, error) {
-	return &partitioningProcessor{nextLogs: next}, nil
+func createLogsProcessor(_ context.Context, set processor.Settings, cfg component.Config, next consumer.Logs) (processor.Logs, error) {
+	oCfg := cfg.(*Config)
+	partitioner, keyNames, err := newLogsPartitioner(oCfg, set.TelemetrySettings)
+	if err != nil {
+		return nil, err
+	}
+	return &partitioningProcessor{
+		keyNames:        keyNames,
+		logsPartitioner: partitioner,
+		nextLogs:        next,
+	}, nil
 }
 
-func createMetricsProcessor(_ context.Context, _ processor.Settings, cfg component.Config, next consumer.Metrics) (processor.Metrics, error) {
+func createMetricsProcessor(_ context.Context, _ processor.Settings, _ component.Config, next consumer.Metrics) (processor.Metrics, error) {
 	return &partitioningProcessor{nextMetrics: next}, nil
 }
 
-func createTracesProcessor(_ context.Context, _ processor.Settings, cfg component.Config, next consumer.Traces) (processor.Traces, error) {
+func createTracesProcessor(_ context.Context, _ processor.Settings, _ component.Config, next consumer.Traces) (processor.Traces, error) {
 	return &partitioningProcessor{nextTraces: next}, nil
 }
 
-func createProfilesProcessor(_ context.Context, _ processor.Settings, cfg component.Config, next xconsumer.Profiles) (xprocessor.Profiles, error) {
+func createProfilesProcessor(_ context.Context, _ processor.Settings, _ component.Config, next xconsumer.Profiles) (xprocessor.Profiles, error) {
 	return &partitioningProcessor{nextProfiles: next}, nil
 }

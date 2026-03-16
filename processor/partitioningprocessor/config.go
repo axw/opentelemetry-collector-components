@@ -17,10 +17,39 @@
 
 package partitioningprocessor // import "github.com/elastic/opentelemetry-collector-components/processor/partitioningprocessor"
 
+import (
+	"errors"
+	"fmt"
+)
+
 // Config is the configuration for the partitioning processor.
-type Config struct{}
+type Config struct {
+	Keys []PartitionKeyConfig `mapstructure:"keys"`
+}
+
+// PartitionKeyConfig defines a single partition key.
+type PartitionKeyConfig struct {
+	Name  string `mapstructure:"name"`
+	Value string `mapstructure:"value"`
+}
 
 // Validate validates the configuration.
 func (cfg *Config) Validate() error {
+	if len(cfg.Keys) == 0 {
+		return errors.New("at least one partition key must be specified")
+	}
+	seen := make(map[string]struct{}, len(cfg.Keys))
+	for i, key := range cfg.Keys {
+		if key.Name == "" {
+			return fmt.Errorf("keys[%d]: name must not be empty", i)
+		}
+		if key.Value == "" {
+			return fmt.Errorf("keys[%d]: value must not be empty", i)
+		}
+		if _, ok := seen[key.Name]; ok {
+			return fmt.Errorf("keys[%d]: duplicate key name %q", i, key.Name)
+		}
+		seen[key.Name] = struct{}{}
+	}
 	return nil
 }
